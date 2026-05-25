@@ -1,0 +1,16 @@
+{
+  "task_id": "ecom_cup_demo_001",
+  "input": "data/input/ecom_cup_demo.mp4",
+  "instruction": "请从这段 90 秒保温杯开箱视频中剪出 15 秒小红书种草高光视频，突出商品外观、开箱过程和保温卖点；节奏自然，不要有黑屏。",
+  "target_duration": 15,
+  "target_platform": "xiaohongshu",
+  "style": "种草",
+  "aspect_ratio": "9:16",
+  "output_dir": "outputs/ecom_cup_demo_001",
+  "transcript": null,
+  "ground_truth": "data/ground_truth/ecom_cup_demo_001.gt.json",
+  "scene_threshold": 0.3,
+  "min_segment_duration": 4,
+  "max_segment_duration": 12
+}
+

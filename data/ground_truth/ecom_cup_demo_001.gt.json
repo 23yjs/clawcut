@@ -1,0 +1,33 @@
+{
+  "case_id": "ecom_cup_demo_001",
+  "video": "data/input/ecom_cup_demo.mp4",
+  "instruction": "请从这段 90 秒保温杯开箱视频中剪出 15 秒小红书种草高光视频，突出商品外观、开箱过程和保温卖点；节奏自然，不要有黑屏。",
+  "target_duration": 15,
+  "difficulty": "medium",
+  "segments": [
+    {
+      "start": 3.2,
+      "end": 7.8,
+      "label": "开箱展示，商品首次完整出现"
+    },
+    {
+      "start": 18.5,
+      "end": 24.0,
+      "label": "旋转展示商品外观"
+    },
+    {
+      "start": 42.0,
+      "end": 48.5,
+      "label": "保温卖点演示"
+    }
+  ],
+  "must_cover_points": ["商品外观", "开箱", "保温卖点"],
+  "avoid_segments": [
+    {
+      "start": 60.0,
+      "end": 70.0,
+      "reason": "画面模糊或商品不可见"
+    }
+  ]
+}
+

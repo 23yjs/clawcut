@@ -1,0 +1,3 @@
+# Runtime Python code currently uses the standard library only.
+# External system dependency: ffmpeg.
+

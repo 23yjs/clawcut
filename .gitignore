@@ -1,0 +1,10 @@
+.DS_Store
+.env
+__pycache__/
+.pycache/
+*.pyc
+
+outputs/*
+!outputs/.gitkeep
+
+reports/smoke_*
