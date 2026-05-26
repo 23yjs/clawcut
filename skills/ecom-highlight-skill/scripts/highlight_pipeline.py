@@ -15,7 +15,9 @@ Heuristics are kept only for smoke tests and fallback.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -52,6 +54,7 @@ class CandidateSegment:
     planner_reason: str = ""
     transcript: str = ""
     keyframes: List[str] = field(default_factory=list)
+    clip_path: str = ""
 
     @property
     def duration(self) -> float:
@@ -100,6 +103,38 @@ def run_command(cmd: List[str], timeout: int = 600) -> subprocess.CompletedProce
 def write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def file_to_data_url(path: Path, mime_type: Optional[str] = None) -> str:
+    if not path.exists():
+        raise PipelineError(f"Visual input file not found: {path}")
+    guessed = mime_type or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{guessed};base64,{data}"
+
+
+def build_multimodal_content(
+    text: str,
+    video_paths: Optional[List[Path]] = None,
+    image_paths: Optional[List[Path]] = None,
+) -> Tuple[List[Dict[str, Any]], str, int, int]:
+    content: List[Dict[str, Any]] = [{"type": "text", "text": text}]
+    video_count = 0
+    image_count = 0
+    for path in video_paths or []:
+        content.append({"type": "video_url", "video_url": {"url": file_to_data_url(path, "video/mp4")}})
+        video_count += 1
+    for path in image_paths or []:
+        mime_type = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+        content.append({"type": "image_url", "image_url": {"url": file_to_data_url(path, mime_type)}})
+        image_count += 1
+    if video_count:
+        visual_type = "video_data_url"
+    elif image_count:
+        visual_type = "image_data_url"
+    else:
+        visual_type = "text_only"
+    return content, visual_type, video_count, image_count
 
 
 def make_segment_id(index: int) -> str:
@@ -281,6 +316,73 @@ def extract_frame(video_path: Path, timestamp: float, output_path: Path) -> Opti
     return str(output_path) if proc.returncode == 0 and output_path.exists() else None
 
 
+def create_planner_video(video_path: Path, output_dir: Path, args: argparse.Namespace) -> Path:
+    output_path = output_dir / "planner_video.mp4"
+    max_seconds = max(1.0, float(args.planner_video_max_seconds))
+    vf = f"fps={args.planner_video_fps},scale={args.planner_video_width}:-2"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-t",
+        f"{max_seconds:.3f}",
+        "-vf",
+        vf,
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "30",
+        str(output_path),
+    ]
+    proc = run_command(cmd, timeout=900)
+    if proc.returncode != 0:
+        detail = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "unknown ffmpeg error"
+        raise PipelineError(f"ffmpeg failed while creating planner_video.mp4: {detail}")
+    return output_path
+
+
+def create_candidate_clips(
+    video_path: Path,
+    candidates: List[CandidateSegment],
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> List[CandidateSegment]:
+    clips_dir = output_dir / "candidate_clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    for candidate in candidates:
+        clip_path = clips_dir / f"{candidate.segment_id}.mp4"
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            f"{candidate.start:.3f}",
+            "-i",
+            str(video_path),
+            "-t",
+            f"{candidate.duration:.3f}",
+            "-vf",
+            f"scale={args.candidate_clip_width}:-2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "28",
+            "-an",
+            str(clip_path),
+        ]
+        proc = run_command(cmd, timeout=300)
+        if proc.returncode != 0:
+            detail = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "unknown ffmpeg error"
+            raise PipelineError(f"ffmpeg failed while creating candidate clip {candidate.segment_id}: {detail}")
+        candidate.clip_path = str(clip_path)
+    return candidates
+
+
 def extract_planner_frames(video_path: Path, output_dir: Path, interval: float, max_frames: int) -> List[Dict[str, Any]]:
     duration = probe_video_info(video_path)["duration"]
     frames_dir = output_dir / "planner_frames"
@@ -359,9 +461,11 @@ def build_timeline_evidence(
     planner_frames: List[Dict[str, Any]],
     transcript: List[Dict[str, Any]],
     args: argparse.Namespace,
+    planner_video_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     return {
         "video_info": video_info,
+        "planner_video": str(planner_video_path) if planner_video_path else None,
         "user_task": {
             "instruction": args.instruction,
             "target_duration": args.target_duration,
@@ -372,7 +476,7 @@ def build_timeline_evidence(
         "ffmpeg_scene_boundaries": scene_boundaries,
         "sampled_frames": planner_frames,
         "transcript": transcript_summary(transcript),
-        "model_input_mode": "text_only_frame_paths",
+        "model_input_mode": args.visual_input_mode,
     }
 
 
@@ -390,27 +494,60 @@ def extract_json_object(text: str) -> Dict[str, Any]:
 def ark_chat_json(
     system_prompt: str,
     user_payload: Dict[str, Any],
+    video_paths: Optional[List[Path]] = None,
+    image_paths: Optional[List[Path]] = None,
     temperature: float = 0.1,
-    timeout: int = 90,
+    timeout: int = 180,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Dict[str, Any]]:
     api_key = os.getenv("ARK_API_KEY")
     model = os.getenv("ARK_MODEL")
     base_url = os.getenv("ARK_BASE_URL", ARK_DEFAULT_BASE_URL).rstrip("/")
-    metadata = {"enabled": bool(api_key and model), "model": model, "base_url": base_url, "mode": "text_only"}
+    metadata = {
+        "called": False,
+        "enabled": bool(api_key and model),
+        "model": model,
+        "base_url": base_url,
+        "actual_visual_input_type": "text_only",
+        "video_count": 0,
+        "image_count": 0,
+        "payload_size_bytes": 0,
+        "raw_response_preview": None,
+        "error": None,
+    }
     if not api_key or not model:
-        return None, "ARK_API_KEY or ARK_MODEL is not set.", metadata
+        metadata["error"] = "ARK_API_KEY or ARK_MODEL is not set."
+        return None, metadata["error"], metadata
 
-    body = json.dumps(
+    user_text = json.dumps(user_payload, ensure_ascii=False)
+    try:
+        if video_paths or image_paths:
+            user_content, visual_type, video_count, image_count = build_multimodal_content(user_text, video_paths, image_paths)
+        else:
+            user_content, visual_type, video_count, image_count = user_text, "text_only", 0, 0
+        body = json.dumps(
+            {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": temperature,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+    except Exception as exc:
+        metadata["actual_visual_input_type"] = "unsupported"
+        metadata["error"] = str(exc)
+        return None, str(exc), metadata
+
+    metadata.update(
         {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-            ],
-            "temperature": temperature,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
+            "actual_visual_input_type": visual_type,
+            "video_count": video_count,
+            "image_count": image_count,
+            "payload_size_bytes": len(body),
+        }
+    )
     request = urllib.request.Request(
         f"{base_url}/chat/completions",
         data=body,
@@ -418,6 +555,7 @@ def ark_chat_json(
         method="POST",
     )
     try:
+        metadata["called"] = True
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
         content = payload["choices"][0]["message"]["content"]
@@ -428,9 +566,26 @@ def ark_chat_json(
         return None, str(exc), metadata
 
 
-def ark_candidate_planner(timeline_evidence: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str], Dict[str, Any]]:
+def ark_candidate_planner(
+    timeline_evidence: Dict[str, Any],
+    planner_video_path: Optional[Path],
+    args: argparse.Namespace,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], Dict[str, Any]]:
+    if args.visual_input_mode in {"video", "clip"} and (not planner_video_path or not planner_video_path.exists()):
+        return None, "planner_video.mp4 is required for Ark Candidate Planner.", {
+            "called": False,
+            "enabled": bool(os.getenv("ARK_API_KEY") and os.getenv("ARK_MODEL")),
+            "model": os.getenv("ARK_MODEL"),
+            "base_url": os.getenv("ARK_BASE_URL", ARK_DEFAULT_BASE_URL).rstrip("/"),
+            "actual_visual_input_type": "unsupported",
+            "video_count": 0,
+            "image_count": 0,
+            "payload_size_bytes": 0,
+            "error": "planner_video.mp4 is missing",
+        }
     system = (
-        "你是电商短视频候选切片规划模型。你只负责基于视频证据规划语义候选边界，"
+        "你是电商短视频候选切片规划模型。你会看到原始视频的压缩预览版，"
+        "请基于真实视频内容、用户指令、scene boundaries 和字幕规划语义候选边界。"
         "不要给分，不要决定最终剪辑方案。必须只输出 JSON。"
     )
     user = {
@@ -452,7 +607,9 @@ def ark_candidate_planner(timeline_evidence: Dict[str, Any]) -> Tuple[Optional[D
         },
         "rules": ["不要输出 score", "不要输出最终 selected_segments", "时间戳必须在视频范围内", "reason 必须使用中文"],
     }
-    data, warning, meta = ark_chat_json(system, user)
+    video_paths = [planner_video_path] if planner_video_path and args.visual_input_mode in {"video", "clip"} else None
+    image_paths = [Path(row["path"]) for row in timeline_evidence.get("sampled_frames", [])] if args.visual_input_mode == "keyframes" else None
+    data, warning, meta = ark_chat_json(system, user, video_paths=video_paths, image_paths=image_paths)
     if warning:
         return None, f"Candidate Planner failed or unavailable: {warning}", meta
     return data, None, meta
@@ -732,38 +889,84 @@ def heuristic_score(candidate: CandidateSegment, instruction: str, total_duratio
     )
 
 
-def ark_candidate_judge(candidate_evidence: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str], Dict[str, Any]]:
+def ark_candidate_judge(
+    candidate_evidence: Dict[str, Any],
+    candidates: List[CandidateSegment],
+    args: argparse.Namespace,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], Dict[str, Any]]:
     system = (
         "你是严格的电商短视频 Candidate Judge。你必须独立对每个候选切片评分，"
-        "输出 score、score_breakdown、covered_points、quality_issues、中文 reason。必须只输出 JSON。"
+        "你会看到每个候选片段对应的真实短视频 clip。请基于 clip 内容独立评分，"
+        "不要根据文件名或路径猜测，不要依赖 heuristic。必须只输出 JSON。"
     )
-    user = {
-        "candidate_evidence": candidate_evidence,
-        "output_schema": {
-            "segments": [
-                {
-                    "segment_id": "seg_0001",
-                    "score": 0.0,
-                    "score_breakdown": {
-                        "product_visibility": 0.0,
-                        "selling_point_relevance": 0.0,
-                        "visual_quality": 0.0,
-                        "action_completeness": 0.0,
-                        "instruction_match": 0.0,
-                        "platform_fit": 0.0,
-                    },
-                    "covered_points": ["商品外观"],
-                    "quality_issues": [],
-                    "reason": "中文理由",
-                }
-            ]
-        },
-        "rules": ["score 必须在 0 到 1", "不要新增不存在的 segment_id", "reason 必须中文"],
+    metadata: Dict[str, Any] = {
+        "called": False,
+        "enabled": bool(os.getenv("ARK_API_KEY") and os.getenv("ARK_MODEL")),
+        "model": os.getenv("ARK_MODEL"),
+        "base_url": os.getenv("ARK_BASE_URL", ARK_DEFAULT_BASE_URL).rstrip("/"),
+        "actual_visual_input_type": "video_data_url" if args.visual_input_mode in {"video", "clip"} else "image_data_url",
+        "video_count": 0,
+        "image_count": 0,
+        "batch_count": 0,
+        "payload_size_bytes": 0,
+        "raw_response_preview": "",
+        "error": None,
     }
-    data, warning, meta = ark_chat_json(system, user)
-    if warning:
-        return None, f"Candidate Judge failed or unavailable: {warning}", meta
-    return data, None, meta
+    all_segments: List[Dict[str, Any]] = []
+    by_id = {candidate.segment_id: candidate for candidate in candidates}
+    evidence_rows = candidate_evidence.get("candidates", [])
+    batch_size = max(1, int(args.judge_batch_size))
+    for batch_start in range(0, len(evidence_rows), batch_size):
+        batch = evidence_rows[batch_start : batch_start + batch_size]
+        batch_ids = [str(row["segment_id"]) for row in batch]
+        batch_candidates = [by_id[segment_id] for segment_id in batch_ids if segment_id in by_id]
+        if args.visual_input_mode in {"video", "clip"}:
+            video_paths = [Path(candidate.clip_path) for candidate in batch_candidates if candidate.clip_path]
+            image_paths = None
+            if len(video_paths) != len(batch_candidates):
+                return None, "Candidate Judge requires candidate clip files, but at least one clip is missing.", metadata
+        else:
+            video_paths = None
+            image_paths = [Path(path) for candidate in batch_candidates for path in candidate.keyframes]
+        user = {
+            "user_task": candidate_evidence["user_task"],
+            "video_info": candidate_evidence["video_info"],
+            "candidates": batch,
+            "output_schema": {
+                "segments": [
+                    {
+                        "segment_id": "seg_0001",
+                        "score": 0.0,
+                        "score_breakdown": {
+                            "product_visibility": 0.0,
+                            "selling_point_relevance": 0.0,
+                            "visual_quality": 0.0,
+                            "action_completeness": 0.0,
+                            "instruction_match": 0.0,
+                            "platform_fit": 0.0,
+                        },
+                        "covered_points": ["商品外观"],
+                        "quality_issues": [],
+                        "reason": "中文理由",
+                    }
+                ]
+            },
+            "rules": ["score 必须在 0 到 1", "只返回本 batch 中的 segment_id", "reason 必须中文"],
+        }
+        data, warning, batch_meta = ark_chat_json(system, user, video_paths=video_paths, image_paths=image_paths)
+        metadata["called"] = metadata["called"] or bool(batch_meta.get("called"))
+        metadata["video_count"] += int(batch_meta.get("video_count", 0))
+        metadata["image_count"] += int(batch_meta.get("image_count", 0))
+        metadata["batch_count"] += 1
+        metadata["payload_size_bytes"] += int(batch_meta.get("payload_size_bytes", 0))
+        metadata["raw_response_preview"] = batch_meta.get("raw_response_preview") or metadata["raw_response_preview"]
+        if batch_meta.get("actual_visual_input_type") != "text_only":
+            metadata["actual_visual_input_type"] = str(batch_meta.get("actual_visual_input_type"))
+        if warning:
+            metadata["error"] = warning
+            return None, f"Candidate Judge failed or unavailable: {warning}", metadata
+        all_segments.extend((data or {}).get("segments", []))
+    return {"segments": all_segments}, None, metadata
 
 
 def parse_judge_results(payload: Optional[Dict[str, Any]], candidates: List[CandidateSegment]) -> List[SegmentJudgeResult]:
@@ -1153,6 +1356,14 @@ def candidate_stats(candidates: List[CandidateSegment]) -> Dict[str, Any]:
     }
 
 
+def fallback_allowed(args: argparse.Namespace) -> bool:
+    return args.run_mode == "fallback" or args.allow_fallback
+
+
+def smoke_mode(args: argparse.Namespace) -> bool:
+    return args.run_mode == "smoke"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Clip e-commerce highlight segments from a product video.")
     parser.add_argument("--input", required=True, help="Path to source video.")
@@ -1164,9 +1375,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-platform", default="xiaohongshu", help="Target platform: xiaohongshu, douyin, taobao, etc.")
     parser.add_argument("--style", default="种草", help="Editing style, e.g. 种草、带货、开箱、测评.")
     parser.add_argument("--aspect-ratio", default="source", choices=["source", "9:16", "16:9", "1:1"], help="Output aspect ratio.")
+    parser.add_argument("--run-mode", default="model", choices=["model", "fallback", "smoke"], help="model requires Ark; fallback allows heuristic fallback; smoke skips Ark.")
+    parser.add_argument("--allow-fallback", action="store_true", help="Allow heuristic fallback when Ark fails.")
+    parser.add_argument("--visual-input-mode", default="video", choices=["video", "clip", "keyframes"])
     parser.add_argument("--candidate-mode", default="llm_hybrid", choices=["scene", "window", "hybrid", "llm_hybrid"])
-    parser.add_argument("--scoring-mode", default="fallback", choices=["model", "fallback", "heuristic"])
-    parser.add_argument("--assembly-mode", default="fallback", choices=["model", "fallback", "heuristic"])
+    parser.add_argument("--scoring-mode", default="model", choices=["model", "fallback", "heuristic"])
+    parser.add_argument("--assembly-mode", default="model", choices=["model", "fallback", "heuristic"])
+    parser.add_argument("--planner-video-max-seconds", type=float, default=180.0)
+    parser.add_argument("--planner-video-fps", type=float, default=1.0)
+    parser.add_argument("--planner-video-width", type=int, default=512)
+    parser.add_argument("--candidate-clip-width", type=int, default=512)
+    parser.add_argument("--judge-batch-size", type=int, default=2)
     parser.add_argument("--planner-frame-interval", type=float, default=2.0)
     parser.add_argument("--max-planner-frames", type=int, default=48)
     parser.add_argument("--keyframes-per-segment", type=int, default=3)
@@ -1215,19 +1434,22 @@ def pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     transcript = load_transcript(Path(args.transcript).expanduser() if args.transcript else None)
     video_info = probe_video_info(input_path)
     scene_boundaries = detect_scene_boundaries(input_path, args.scene_threshold, float(video_info["duration"]))
+    planner_video_path = create_planner_video(input_path, output_dir, args)
+    planner_video_info = probe_video_info(planner_video_path)
     planner_frames = extract_planner_frames(input_path, output_dir, args.planner_frame_interval, args.max_planner_frames)
-    timeline_evidence = build_timeline_evidence(video_info, scene_boundaries, planner_frames, transcript, args)
+    timeline_evidence = build_timeline_evidence(video_info, scene_boundaries, planner_frames, transcript, args, planner_video_path)
     write_json(output_dir / "video_info.json", video_info)
+    write_json(output_dir / "planner_video_info.json", planner_video_info)
     write_json(output_dir / "ffmpeg_scenes.json", {"boundaries": scene_boundaries, "threshold": args.scene_threshold})
     write_json(output_dir / "timeline_evidence.json", timeline_evidence)
 
     llm_plan: Optional[Dict[str, Any]] = None
     ark_metadata: Dict[str, Any] = {}
-    if args.candidate_mode == "llm_hybrid":
-        llm_plan, planner_warning, planner_meta = ark_candidate_planner(timeline_evidence)
+    if args.candidate_mode == "llm_hybrid" and not smoke_mode(args):
+        llm_plan, planner_warning, planner_meta = ark_candidate_planner(timeline_evidence, planner_video_path, args)
         ark_metadata["candidate_planner"] = planner_meta
         if planner_warning:
-            if args.scoring_mode == "model":
+            if not fallback_allowed(args):
                 raise PipelineError(planner_warning)
             warnings.append(f"{planner_warning}; falling back to hybrid candidate generation.")
             fallback_meta["used"] = True
@@ -1235,16 +1457,20 @@ def pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             fallback_meta["reasons"].append(planner_warning)
             pipeline_meta["candidate_generation"] = "ffmpeg_hybrid_fallback"
         else:
-            pipeline_meta["candidate_generation"] = "ffmpeg_plus_llm_candidate_planner"
+            pipeline_meta["candidate_generation"] = "ark_video_candidate_planner"
     else:
-        pipeline_meta["candidate_generation"] = f"ffmpeg_{args.candidate_mode}"
+        if args.candidate_mode == "llm_hybrid" and smoke_mode(args):
+            pipeline_meta["candidate_generation"] = "smoke_ffmpeg_hybrid"
+        else:
+            pipeline_meta["candidate_generation"] = f"ffmpeg_{args.candidate_mode}"
     write_json(output_dir / "llm_candidate_plan.json", llm_plan or {"semantic_events": [], "candidate_boundary_suggestions": [], "avoid_ranges": []})
 
-    effective_candidate_mode = "hybrid" if args.candidate_mode == "llm_hybrid" and not llm_plan else args.candidate_mode
+    effective_candidate_mode = "hybrid" if args.candidate_mode == "llm_hybrid" and (not llm_plan or smoke_mode(args)) else args.candidate_mode
     original_candidate_mode = args.candidate_mode
     args.candidate_mode = effective_candidate_mode
     candidates = generate_candidates(input_path, args, video_info, scene_boundaries, llm_plan, transcript)
     args.candidate_mode = original_candidate_mode
+    candidates = create_candidate_clips(input_path, candidates, output_dir, args)
     candidates = extract_candidate_keyframes(input_path, candidates, output_dir / "frames", args.keyframes_per_segment)
     candidate_evidence = build_candidate_evidence(candidates, args, video_info)
     write_json(output_dir / "candidates.json", {"candidates": [candidate_to_dict(candidate) for candidate in candidates]})
@@ -1267,16 +1493,16 @@ def pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         write_json(output_dir / "result.json", payload)
         return payload
 
-    if args.scoring_mode == "heuristic":
+    if smoke_mode(args) or args.scoring_mode == "heuristic":
         judge_results = [heuristic_score(candidate, args.instruction, float(video_info["duration"])) for candidate in candidates]
-        pipeline_meta["candidate_scoring"] = "heuristic"
+        pipeline_meta["candidate_scoring"] = "heuristic_smoke" if smoke_mode(args) else "heuristic"
     else:
-        judge_payload, judge_warning, judge_meta = ark_candidate_judge(candidate_evidence)
+        judge_payload, judge_warning, judge_meta = ark_candidate_judge(candidate_evidence, candidates, args)
         ark_metadata["candidate_judge"] = judge_meta
         judge_results = parse_judge_results(judge_payload, candidates)
         if judge_warning or len(judge_results) < len(candidates):
             reason = judge_warning or "Candidate Judge returned incomplete usable scores."
-            if args.scoring_mode == "model":
+            if not fallback_allowed(args):
                 raise PipelineError(reason)
             warnings.append(f"{reason}; using heuristic scoring fallback.")
             fallback_meta["used"] = True
@@ -1285,12 +1511,12 @@ def pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             judge_results = [heuristic_score(candidate, args.instruction, float(video_info["duration"])) for candidate in candidates]
             pipeline_meta["candidate_scoring"] = "heuristic_fallback"
         else:
-            pipeline_meta["candidate_scoring"] = "llm_candidate_judge"
+            pipeline_meta["candidate_scoring"] = "ark_video_candidate_judge"
     write_json(output_dir / "segment_scores.json", {"segments": [asdict(result) for result in judge_results]})
 
-    if args.assembly_mode == "heuristic":
+    if smoke_mode(args) or args.assembly_mode == "heuristic":
         assembly_plan = constrained_greedy_selector(candidates, judge_results, args.target_duration)
-        pipeline_meta["assembly_planning"] = "heuristic"
+        pipeline_meta["assembly_planning"] = "heuristic_smoke" if smoke_mode(args) else "heuristic"
     else:
         assembly_payload, assembly_warning, assembly_meta = ark_assembly_planner(candidate_evidence, judge_results, args)
         ark_metadata["assembly_planner"] = assembly_meta
@@ -1299,7 +1525,7 @@ def pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         )
         if assembly_warning or not ok:
             reason = assembly_warning or "; ".join(validation_warnings) or "Assembly plan is invalid."
-            if args.assembly_mode == "model":
+            if not fallback_allowed(args):
                 raise PipelineError(reason)
             warnings.append(f"{reason}; using constrained greedy assembly fallback.")
             fallback_meta["used"] = True
@@ -1310,7 +1536,7 @@ def pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         else:
             warnings.extend(validation_warnings)
             assembly_plan = normalized_plan
-            pipeline_meta["assembly_planning"] = "llm_assembly_planner"
+            pipeline_meta["assembly_planning"] = "ark_assembly_planner"
 
     ok, validation_warnings, assembly_plan = validate_assembly_plan(
         assembly_plan, candidates, judge_results, float(video_info["duration"]), args.target_duration

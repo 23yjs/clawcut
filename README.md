@@ -66,20 +66,25 @@
 brew install ffmpeg
 ```
 
-运行单个视频：
+完整模型路径：
 
 ```bash
 python3 skills/ecom-highlight-skill/scripts/highlight_pipeline.py \
   --input data/input/ecom_demo.mp4 \
-  --instruction "剪出 15 秒小红书种草高光，突出商品外观、开箱过程和核心卖点" \
+  --instruction "剪出 15 秒小红书种草高光，突出商品外观、开箱和保温卖点" \
   --target-duration 15 \
   --target-platform xiaohongshu \
   --style 种草 \
   --aspect-ratio 9:16 \
-  --output-dir outputs/ecom_demo \
+  --output-dir outputs/ecom_demo_model \
+  --run-mode model \
+  --visual-input-mode video \
   --candidate-mode llm_hybrid \
-  --scoring-mode fallback \
-  --assembly-mode fallback
+  --planner-video-fps 1 \
+  --planner-video-width 512 \
+  --candidate-clip-width 512 \
+  --max-candidates 16 \
+  --judge-batch-size 2
 ```
 
 无模型环境 smoke test：
@@ -93,9 +98,8 @@ python3 skills/ecom-highlight-skill/scripts/highlight_pipeline.py \
   --style 种草 \
   --aspect-ratio 9:16 \
   --output-dir outputs/ecom_demo_smoke \
-  --candidate-mode hybrid \
-  --scoring-mode heuristic \
-  --assembly-mode heuristic
+  --run-mode smoke \
+  --candidate-mode hybrid
 ```
 
 只调试候选切片：
@@ -108,6 +112,8 @@ python3 skills/ecom-highlight-skill/scripts/highlight_pipeline.py \
   --target-platform xiaohongshu \
   --style 种草 \
   --output-dir outputs/ecom_demo_candidates \
+  --run-mode fallback \
+  --allow-fallback \
   --candidate-mode llm_hybrid \
   --dump-candidates-only
 ```
@@ -144,7 +150,7 @@ skills/ecom-highlight-skill/SKILL.md
 
 ## Ark / 方舟模型配置
 
-默认脚本可在无模型情况下用启发式策略跑通。若要让三阶段模型协同成为主路径，可设置：
+默认 `--run-mode model` 要求 Ark 三阶段全部成功；未配置 Ark 或任一阶段调用失败都会写入 `failure.json` 并退出，不会静默 fallback。若要让三阶段模型协同成为主路径，可设置：
 
 ```bash
 export ARK_API_KEY="your_api_key"
@@ -154,11 +160,13 @@ export ARK_BASE_URL="https://ark.cn-beijing.volces.com/api/v3"
 
 模型主路径包含：
 
-1. Candidate Planner：基于视频信息、scene boundaries、稀疏帧和字幕规划语义候选切片。
-2. Candidate Judge：对每个候选切片输出 `score`、`covered_points`、`quality_issues` 和中文 `reason`。
+1. Candidate Planner：Ark 接收压缩后的 `planner_video.mp4` data URL，结合视频信息、scene boundaries 和字幕规划语义候选切片。
+2. Candidate Judge：Ark 接收每个候选短视频 `candidate_clips/*.mp4` 的 data URL，对候选切片输出 `score`、`covered_points`、`quality_issues` 和中文 `reason`。
 3. Assembly Planner：根据目标时长、平台风格和候选评分生成 `assembly_plan.json`。
 
 `ffmpeg` / `ffprobe` 只负责确定性视频处理：读取元信息、scene detection、抽帧、按 `assembly_plan.json` 裁剪拼接和转码，不参与高光语义评分。
+
+仅当显式使用 `--run-mode fallback --allow-fallback` 时，模型失败才会退回启发式；`--run-mode smoke` 用于无 Ark 的本地调试。
 
 ## 评测重点
 

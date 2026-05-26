@@ -2,13 +2,13 @@
 
 ## 1. 设计原则
 
-EcomHighlightSkill 采用“三阶段大模型协同 + ffmpeg 执行”的架构。大模型负责语义决策，`ffmpeg` / `ffprobe` 只负责确定性视频处理。
+EcomHighlightSkill 采用“Ark 大模型主导决策 + ffmpeg 执行视频处理”的架构。正常运行路径必须调用 Ark；`ffmpeg` / `ffprobe` 只负责确定性视频处理。
 
 ```text
-ffmpeg/ffprobe 提取视频证据
-  -> Candidate Planner 规划候选切片
-  -> Candidate Judge 结构化评分
-  -> Assembly Planner 生成拼接方案
+ffmpeg/ffprobe 提取视频证据并生成 planner_video.mp4 / candidate_clips
+  -> Ark Candidate Planner 读取 planner_video.mp4 data URL 并规划候选切片
+  -> Ark Candidate Judge 读取候选 clip data URL 并结构化评分
+  -> Ark Assembly Planner 生成拼接方案
   -> ffmpeg 按 assembly_plan.json 裁剪、转码、拼接
 ```
 
@@ -20,18 +20,20 @@ Stage 1：视频证据提取
 
 - `probe_video_info`：读取时长、分辨率、fps、格式和编码。
 - `detect_scene_boundaries`：使用 `ffmpeg` scene detection 获取候选边界。
-- `extract_planner_frames`：抽取稀疏时间轴帧，限制最大帧数。
+- `create_planner_video`：生成低 fps、低分辨率的 `planner_video.mp4`，作为 Ark Planner 的主视觉输入。
+- `extract_planner_frames`：抽取稀疏时间轴帧，仅作为辅助或 keyframes 模式输入。
+- `create_candidate_clips`：为每个候选切片生成 `candidate_clips/<segment_id>.mp4`，作为 Ark Judge 的主视觉输入。
 - `extract_candidate_keyframes`：为每个候选片段抽 start/middle/end 关键帧。
 
 Stage 2：Candidate Planner
 
-- 输入用户指令、视频信息、scene boundaries、稀疏帧路径和可选字幕。
+- 输入用户指令、视频信息、scene boundaries、可选字幕，以及 `planner_video.mp4` 的 `video_url` data URL。
 - 输出 `semantic_events`、`candidate_boundary_suggestions`、`avoid_ranges`。
 - 不输出 score，不决定最终拼接。
 
 Stage 3：Candidate Judge
 
-- 输入融合后的候选片段、关键帧、字幕和用户指令。
+- 输入融合后的候选片段、字幕、用户指令，以及每个候选短视频 clip 的 `video_url` data URL。
 - 输出 `score`、`score_breakdown`、`covered_points`、`quality_issues`、中文 `reason`。
 - Judge 不接收 heuristic score，必须独立判断。
 
@@ -47,7 +49,9 @@ Stage 4：Assembly Planner
 
 - 读取视频信息。
 - scene detection。
-- 抽稀疏帧和候选关键帧。
+- 压缩 Planner 视频。
+- 裁剪候选短视频 clip。
+- 抽稀疏帧和候选关键帧作为辅助或 fallback 证据。
 - 按 `assembly_plan.json` 裁剪片段。
 - 统一编码、转码、拼接和比例转换。
 
@@ -61,21 +65,37 @@ Stage 4：Assembly Planner
 
 ## 4. Fallback 策略
 
-系统支持 `model`、`fallback`、`heuristic` 三种模式：
+系统支持 `model`、`fallback`、`smoke` 三种运行模式：
 
-- `model`：模型阶段失败则任务失败并写入 `failure.json`。
-- `fallback`：优先模型，失败时退回对应启发式兜底。
-- `heuristic`：只使用程序兜底，用于本地 smoke test。
+- `model`：默认模式。Candidate Planner、Candidate Judge、Assembly Planner 必须全部调用 Ark 成功，否则任务失败并写入 `failure.json`。
+- `fallback`：优先 Ark，只有显式 `--allow-fallback` 时才允许退回对应启发式兜底。
+- `smoke`：不要求 Ark，只使用程序兜底，用于本地调试。
 
 `segments.json` / `result.json` 中统一记录：
 
 ```json
 {
   "pipeline": {
-    "candidate_generation": "ffmpeg_plus_llm_candidate_planner | ffmpeg_hybrid_fallback | ffmpeg_hybrid",
-    "candidate_scoring": "llm_candidate_judge | heuristic_fallback | heuristic",
-    "assembly_planning": "llm_assembly_planner | heuristic_fallback | heuristic",
+    "candidate_generation": "ark_video_candidate_planner | ffmpeg_hybrid_fallback | smoke_ffmpeg_hybrid",
+    "candidate_scoring": "ark_video_candidate_judge | heuristic_fallback | heuristic_smoke",
+    "assembly_planning": "ark_assembly_planner | heuristic_fallback | heuristic_smoke",
     "rendering": "ffmpeg"
+  },
+  "ark": {
+    "candidate_planner": {
+      "called": true,
+      "actual_visual_input_type": "video_data_url",
+      "video_count": 1
+    },
+    "candidate_judge": {
+      "called": true,
+      "actual_visual_input_type": "video_data_url",
+      "video_count": 16
+    },
+    "assembly_planner": {
+      "called": true,
+      "actual_visual_input_type": "text_only"
+    }
   },
   "fallback": {
     "used": false,
@@ -91,10 +111,13 @@ Stage 4：Assembly Planner
 
 - `video_info.json`
 - `ffmpeg_scenes.json`
+- `planner_video.mp4`
+- `planner_video_info.json`
 - `timeline_evidence.json`
 - `planner_frames/`
 - `llm_candidate_plan.json`
 - `candidates.json`
+- `candidate_clips/`
 - `candidate_evidence.json`
 - `candidate_stats.json`
 - `frames/`
@@ -111,7 +134,7 @@ Stage 4：Assembly Planner
 
 ## 6. 验证方式
 
-候选调试：
+完整模型路径：
 
 ```bash
 python3 skills/ecom-highlight-skill/scripts/highlight_pipeline.py \
@@ -120,9 +143,16 @@ python3 skills/ecom-highlight-skill/scripts/highlight_pipeline.py \
   --target-duration 15 \
   --target-platform xiaohongshu \
   --style 种草 \
-  --output-dir outputs/ecom_demo_candidates \
+  --aspect-ratio 9:16 \
+  --output-dir outputs/ecom_demo_model \
+  --run-mode model \
+  --visual-input-mode video \
   --candidate-mode llm_hybrid \
-  --dump-candidates-only
+  --planner-video-fps 1 \
+  --planner-video-width 512 \
+  --candidate-clip-width 512 \
+  --max-candidates 16 \
+  --judge-batch-size 2
 ```
 
 无模型 smoke test：
@@ -136,7 +166,23 @@ python3 skills/ecom-highlight-skill/scripts/highlight_pipeline.py \
   --style 种草 \
   --aspect-ratio 9:16 \
   --output-dir outputs/ecom_demo_smoke \
-  --candidate-mode hybrid \
-  --scoring-mode heuristic \
-  --assembly-mode heuristic
+  --run-mode smoke \
+  --candidate-mode hybrid
+```
+
+允许 fallback 的调试路径：
+
+```bash
+python3 skills/ecom-highlight-skill/scripts/highlight_pipeline.py \
+  --input data/input/ecom_demo.mp4 \
+  --instruction "剪出 15 秒小红书种草高光，突出商品外观、开箱和保温卖点" \
+  --target-duration 15 \
+  --target-platform xiaohongshu \
+  --style 种草 \
+  --aspect-ratio 9:16 \
+  --output-dir outputs/ecom_demo_fallback \
+  --run-mode fallback \
+  --visual-input-mode video \
+  --candidate-mode llm_hybrid \
+  --allow-fallback
 ```
