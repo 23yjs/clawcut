@@ -25,14 +25,16 @@ http://127.0.0.1:18789
 在 OpenClaw 控制台中找到 Agent / Skills 相关配置，将本项目 Skill 路径加入：
 
 ```text
-/Users/df/Documents/clawcut/skills/ecom-highlight-skill/SKILL.md
+~/.openclaw/workspace/skills/ecom-highlight-skill/SKILL.md
 ```
 
 如果 UI 要求填写 Skill 目录，则填写：
 
 ```text
-/Users/df/Documents/clawcut/skills/ecom-highlight-skill
+~/.openclaw/workspace/skills/ecom-highlight-skill
 ```
+
+注意：OpenClaw 本地版是在 Linux Docker 容器中执行 Skill。任务输入、输出路径应使用容器工作区路径或相对路径，不要使用 macOS 的 `/Users/df/...` 路径。
 
 ## 3. OpenClaw 任务输入
 
@@ -41,19 +43,26 @@ http://127.0.0.1:18789
 ```text
 请使用 EcomHighlightSkill 处理本地视频：
 
-input: /Users/df/Documents/clawcut/data/input/ecom_cup_demo.mp4
+input: data/input/ecom_cup_demo.mp4
 instruction: 请从这段商品视频中剪出 30 秒小红书种草高光，突出商品外观、开箱过程和核心卖点；节奏自然，不要有黑屏。
 target_duration: 30
 target_platform: xiaohongshu
 style: 种草
 aspect_ratio: 9:16
-output_dir: /Users/df/Documents/clawcut/outputs/openclaw_ecom_cup_demo_30s
+output_dir: outputs/openclaw_ecom_cup_demo_30s
 
 要求：
 1. 调用 EcomHighlightSkill 的 Python Runner。
 2. 输出 highlight.mp4、segments.json、timeline_report.md、result.json。
 3. 返回选中片段时间戳、评分、选择理由和 warning。
 4. 如果失败，请返回 failure.json 路径和错误原因。
+```
+
+如果更想使用绝对路径，请使用容器内路径：
+
+```text
+input: /home/node/.openclaw/workspace/data/input/ecom_cup_demo.mp4
+output_dir: /home/node/.openclaw/workspace/outputs/openclaw_ecom_cup_demo_30s
 ```
 
 ## 4. 成功判断
@@ -89,4 +98,3 @@ warnings 为空或只有可解释 warning
 ```text
 本项目已完成 OpenClaw 调度链路验证。OpenClaw 读取 EcomHighlightSkill 的 SKILL.md 后，调用本地 Python Runner 执行电商视频高光剪辑任务，成功生成 highlight.mp4、segments.json、timeline_report.md 和 result.json，完成输入、调度、Skill 执行、结果输出的端到端闭环。
 ```
-
